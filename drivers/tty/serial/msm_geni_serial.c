@@ -3805,3 +3805,4 @@ module_exit(msm_geni_serial_exit);
 MODULE_DESCRIPTION("Serial driver for GENI based QTI serial cores");
 MODULE_LICENSE("GPL v2");
 MODULE_ALIAS("tty:msm_geni_geni_serial");
+
