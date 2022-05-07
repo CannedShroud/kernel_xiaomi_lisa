@@ -28,6 +28,19 @@ static struct kmem_cache *victim_entry_slab;
 static unsigned int count_bits(const unsigned long *addr,
 				unsigned int offset, unsigned int len);
 
+#ifdef CONFIG_MACH_XIAOMI
+static inline bool should_break_gc(struct f2fs_sb_info *sbi)
+{
+	if (freezing(current) || kthread_should_stop())
+		return true;
+
+	if (sbi->gc_mode == GC_URGENT_HIGH)
+		return false;
+
+	return !is_idle(sbi, GC_TIME);
+}
+#endif
+
 static int gc_thread_func(void *data)
 {
 	struct f2fs_sb_info *sbi = data;
@@ -35,6 +48,10 @@ static int gc_thread_func(void *data)
 	wait_queue_head_t *wq = &sbi->gc_thread->gc_wait_queue_head;
 	wait_queue_head_t *fggc_wq = &sbi->gc_thread->fggc_wq;
 	unsigned int wait_ms;
+#ifdef CONFIG_MACH_XIAOMI
+	unsigned int gc_count, i;
+	bool boost;
+#endif
 
 	wait_ms = gc_th->min_sleep_time;
 
@@ -77,6 +94,10 @@ static int gc_thread_func(void *data)
 			stat_other_skip_bggc_count(sbi);
 			continue;
 		}
+
+#ifdef CONFIG_MACH_XIAOMI
+		boost = sbi->gc_booster;
+#endif
 
 		/*
 		 * [GC triggering condition]
@@ -127,11 +148,51 @@ static int gc_thread_func(void *data)
 			goto next;
 		}
 
+#ifdef CONFIG_MACH_XIAOMI
+		if (boost)
+			calculate_sleep_time(sbi, gc_th, &wait_ms);
+		else {
+#endif
 		if (has_enough_invalid_blocks(sbi))
 			decrease_sleep_time(gc_th, &wait_ms);
 		else
 			increase_sleep_time(gc_th, &wait_ms);
+#ifdef CONFIG_MACH_XIAOMI
+		}
+#endif
 do_gc:
+#ifdef CONFIG_MACH_XIAOMI
+		gc_count = (boost && !foreground) ? get_gc_count(sbi) : 1;
+
+		for (i = 0; i < gc_count; i++) {
+			/*
+			 * f2fs_gc will release gc_lock before return,
+			 * so we need to relock it before calling f2fs_gc.
+			 */
+			if (i && !f2fs_down_write_trylock(&sbi->gc_lock)) {
+				stat_other_skip_bggc_count(sbi);
+				break;
+			}
+
+			if (!foreground)
+				stat_inc_bggc_count(sbi->stat_info);
+
+			sync_mode = F2FS_OPTION(sbi).bggc_mode == BGGC_MODE_SYNC;
+
+			/* foreground GC was been triggered via f2fs_balance_fs() */
+			if (foreground)
+				sync_mode = false;
+
+			/* if return value is not 0, no victim was selected */
+			if (f2fs_gc(sbi, sync_mode, !foreground, false, NULL_SEGNO)) {
+				wait_ms = gc_th->no_gc_sleep_time;
+				break;
+			}
+
+			if (should_break_gc(sbi))
+				break;
+		}
+#else
 		if (!foreground)
 			stat_inc_bggc_count(sbi->stat_info);
 
@@ -144,6 +205,7 @@ do_gc:
 		/* if return value is not zero, no victim was selected */
 		if (f2fs_gc(sbi, sync_mode, !foreground, false, NULL_SEGNO))
 			wait_ms = gc_th->no_gc_sleep_time;
+#endif
 
 		if (foreground)
 			wake_up_all(&gc_th->fggc_wq);
